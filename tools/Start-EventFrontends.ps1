@@ -1,73 +1,90 @@
 $ErrorActionPreference = 'Stop'
 
+# Project paths
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $logDirectory = Join-Path $projectRoot 'logs'
-New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 $launcherLogPath = Join-Path $logDirectory 'launcher.log'
 
-function Write-LauncherLog {
-    param([string]$Message)
-    Add-Content -LiteralPath $launcherLogPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
-}
+# Ensure log directory exists
+New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 
+# Find npm
 $npmCommand = (Get-Command npm.cmd -ErrorAction Stop).Source
 
+function Write-LauncherLog {
+    param([Parameter(Mandatory)][string]$Message)
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Add-Content -LiteralPath $launcherLogPath -Value "$timestamp $Message"
+}
+
 function Test-PortListening {
-    param([int]$Port)
-    return $null -ne (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
+    param([Parameter(Mandatory)][ValidateRange(1, 65535)][int]$Port)
+
+    try {
+        return [bool](Get-NetTCPConnection `
+            -State Listen `
+            -LocalPort $Port `
+            -ErrorAction Stop |
+            Select-Object -First 1)
+    }
+    catch {
+        return $false
+    }
 }
 
 function Start-Frontend {
     param(
-        [string]$Name,
-        [string]$Directory,
-        [int]$Port
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][ValidateRange(1, 65535)][int]$Port
     )
 
+    # Validate project directory
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        $message = "$Name directory not found: $Directory"
+        Write-LauncherLog "ERROR: $message"
+        throw $message
+    }
+
+    # Skip if the port is already occupied by a listening process
     if (Test-PortListening -Port $Port) {
-        Write-Output "$Name is already running on http://localhost:$Port"
+        $message = "$Name is already running on http://localhost:$Port"
+        Write-Output $message
         Write-LauncherLog "$Name already running on port $Port"
         return
     }
 
     $logPath = Join-Path $logDirectory "$Name.log"
     $errorLogPath = Join-Path $logDirectory "$Name.error.log"
-    $arguments = @('run', 'dev', '--', '--host', '127.0.0.1', '--port', $Port.ToString())
 
-    Start-Process `
-        -FilePath $npmCommand `
-        -ArgumentList $arguments `
-        -WorkingDirectory (Join-Path $projectRoot $Directory) `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $logPath `
-        -RedirectStandardError $errorLogPath | Out-Null
+    $arguments = @(
+        'run'
+        'dev'
+        '--'
+        '--host'
+        '127.0.0.1'
+        '--port'
+        $Port.ToString()
+    )
 
-    Write-Output "Starting $Name on http://localhost:$Port"
-    Write-LauncherLog "Started $Name on port $Port"
-}
+    try {
+        Write-LauncherLog "Starting $Name on port $Port"
 
-Start-Frontend -Name 'public-client' -Directory 'frontend-demo/public-client' -Port 5173
-Start-Frontend -Name 'admin-client' -Directory 'frontend-demo/admin-client' -Port 5174
+        $process = Start-Process `
+            -FilePath $npmCommand `
+            -ArgumentList $arguments `
+            -WorkingDirectory $Directory `
+            -RedirectStandardOutput $logPath `
+            -RedirectStandardError $errorLogPath `
+            -PassThru
 
-$deadline = (Get-Date).AddSeconds(30)
-do {
-    $publicReady = Test-PortListening -Port 5173
-    $adminReady = Test-PortListening -Port 5174
-    if ($publicReady -and $adminReady) {
-        break
+        Write-LauncherLog "$Name launched with PID $($process.Id)"
+
+        Write-Output "$Name launch requested on http://localhost:$Port (PID: $($process.Id))"
     }
-    Start-Sleep -Milliseconds 500
-} while ((Get-Date) -lt $deadline)
-
-if (-not (Test-PortListening -Port 5173) -or -not (Test-PortListening -Port 5174)) {
-    Write-LauncherLog 'Frontend startup failed; check individual client logs.'
-    Write-Error "One or both frontends did not start. Check logs in $logDirectory"
-    exit 1
+    catch {
+        Write-LauncherLog "ERROR: Failed to start $Name. $($_.Exception.Message)"
+        throw
+    }
 }
-
-Write-Output 'Both frontends are ready:'
-Write-Output 'Public: http://localhost:5173'
-Write-Output 'Admin:  http://localhost:5174'
-Start-Process 'http://localhost:5173'
-Start-Process 'http://localhost:5174'
-Write-LauncherLog 'Opened public and admin URLs in the default browser.'
